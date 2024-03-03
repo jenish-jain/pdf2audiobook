@@ -53,7 +53,7 @@ LABEL_HEADER = "header"
 LABEL_CAPTION = "caption"
 LABEL_OTHER = "other"
 FEATURE_CSV_HEADER = (
-    "id,text,chars,width,height,area,char_size,pos_x,pos_y,aspect,layout"
+    "id,text,chars,width,height,area,char_size,pos_x,pos_y,aspect,word_count,average_word_height,layout"
 )
 
 # ML API clients
@@ -66,6 +66,7 @@ automl_client = automl.TablesClient(project=project_id, region=compute_region)
 
 def p2a_gcs_trigger(file, context):
 
+    print("Trigger received for pdf to audio conversion {}".format(file))
     # get bucket and blob
     file_name = file["name"]
     bucket = None
@@ -96,6 +97,7 @@ def p2a_gcs_trigger(file, context):
 
 def p2a_ocr_pdf(bucket, pdf_blob):
 
+    print("starting with OCR for file {}".format(pdf_blob.name))
     # define input config
     gcs_source_uri = "gs://{}/{}".format(bucket.name, pdf_blob.name)
     gcs_source = vision.types.GcsSource(uri=gcs_source_uri)
@@ -120,7 +122,7 @@ def p2a_ocr_pdf(bucket, pdf_blob):
     )
     async_response = vision_client.async_batch_annotate_files(requests=[async_request])
     print("Started OCR for file {}".format(pdf_blob.name))
-
+    print("done with OCR response {}".format(async_response))
     # convert PDF to PNG files for annotation
     if ANNOTATION_MODE:
         convert_pdf2png(bucket, pdf_blob)
@@ -128,6 +130,7 @@ def p2a_ocr_pdf(bucket, pdf_blob):
 
 def p2a_predict(bucket, json_blob):
 
+    print("starting with prediction for file {}".format(json_blob.name))
     # get pdf id and first page number
     m = re.match("(.*).output-([0-9]+)-.*", json_blob.name)
     pdf_id = m.group(1)
@@ -165,7 +168,9 @@ def build_feature_csv(json_blob, pdf_id, first_page):
 
     # parse json
     json_string = json_blob.download_as_string()
+    # print("build_feature_csv string response {}".format(json_string))
     json_response = json_format.Parse(json_string, vision.types.AnnotateFileResponse())
+    # print("build_feature_csv json response {}".format(json_response))
 
     # covert the json file to a bag of CSV lines
     csv = ""
@@ -187,7 +192,7 @@ def build_feature_csv(json_blob, pdf_id, first_page):
 
             # output to csv
             for f in page_features:
-                csv += '{},"{}",{},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{}\n'.format(
+                csv += '{},"{}",{},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{}\n'.format(
                     f["para_id"],
                     f["text"],
                     f["chars"],
@@ -198,6 +203,8 @@ def build_feature_csv(json_blob, pdf_id, first_page):
                     f["pos_x"],
                     f["pos_y"],
                     f["aspect"],
+                    f["word_count"],
+                    f["average_word_height"],
                     f["layout"],
                 )
 
@@ -209,6 +216,7 @@ def extract_paragraph_feature(para_id, para):
 
     # collect text
     text = ""
+    w_height_list = []
     for word in para.words:
         for symbol in word.symbols:
             text += symbol.text
@@ -216,6 +224,14 @@ def extract_paragraph_feature(para_id, para):
                 break_type = symbol.property.detected_break.type
                 if str(break_type) == "1":
                     text += " "  # if the break is SPACE
+        w_y_list = []
+        for vertices in word.bounding_box.normalized_vertices:
+            # print("word vertice {}".format(vertices))
+            w_y_list.append(vertices.y)
+            word_height = (max(w_y_list) - min(w_y_list))
+            w_height_list.append(word_height)
+    
+    # print("word height list {}".format(w_height_list))
 
     # remove double quotes
     text = text.replace('"', "")
@@ -241,6 +257,9 @@ def extract_paragraph_feature(para_id, para):
     f["pos_y"] = (f["height"] / 2.0) + min(y_list)
     f["aspect"] = f["width"] / f["height"] if f["height"] > 0 else 0
     f["layout"] = "h" if f["aspect"] > 1 else "v"
+    f["word_count"] = len(w_height_list)
+    f["average_word_height"] = sum(w_height_list) / len(w_height_list)
+    # if layout is h and average word height > 70% then consider this
 
     return f
 
