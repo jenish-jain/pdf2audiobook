@@ -27,6 +27,8 @@ import ghostscript
 import locale
 import glob
 import time
+import pandas as pd
+import jenkspy
 
 from pydub import AudioSegment
 
@@ -35,13 +37,6 @@ from google.cloud import vision
 from google.cloud import texttospeech
 from google.cloud import automl_v1beta1 as automl
 from google.protobuf import json_format
-
-# generate PNGs for each page and labeled CSV for annotation
-ANNOTATION_MODE = False
-
-# AutoML Tables configs
-compute_region = "us-central1"
-model_display_name = "<YOUR MODEL DISPLAY NAME>"
 
 # break length
 SECTION_BREAK = 2  # sec
@@ -52,20 +47,18 @@ LABEL_BODY = "body"
 LABEL_HEADER = "header"
 LABEL_CAPTION = "caption"
 LABEL_OTHER = "other"
-FEATURE_CSV_HEADER = (
-    "id,text,chars,width,height,area,char_size,pos_x,pos_y,aspect,layout"
-)
+FEATURE_CSV_HEADER = "id,text,chars,width,height,area,char_size,pos_x,pos_y,aspect,word_count,average_word_height,layout"
 
 # ML API clients
 project_id = os.environ["GCP_PROJECT"]
 vision_client = vision.ImageAnnotatorClient()
 storage_client = storage.Client()
 speech_client = texttospeech.TextToSpeechClient()
-automl_client = automl.TablesClient(project=project_id, region=compute_region)
 
 
 def p2a_gcs_trigger(file, context):
 
+    print("Trigger received for pdf to audio conversion {}".format(file))
     # get bucket and blob
     file_name = file["name"]
     bucket = None
@@ -86,16 +79,14 @@ def p2a_gcs_trigger(file, context):
         return
 
     # generate speech (or generate labels for annotation)
-    if file_name.lower().endswith("tables_1.csv"):
-        if ANNOTATION_MODE:
-            p2a_generate_labels(bucket, file_blob)
-        else:
-            p2a_generate_speech(bucket, file_blob)
+    if file_name.lower().endswith(".csv"):
+        p2a_generate_speech(bucket, file_blob)
         return
 
 
 def p2a_ocr_pdf(bucket, pdf_blob):
 
+    print("starting with OCR for file {}".format(pdf_blob.name))
     # define input config
     gcs_source_uri = "gs://{}/{}".format(bucket.name, pdf_blob.name)
     gcs_source = vision.types.GcsSource(uri=gcs_source_uri)
@@ -120,45 +111,25 @@ def p2a_ocr_pdf(bucket, pdf_blob):
     )
     async_response = vision_client.async_batch_annotate_files(requests=[async_request])
     print("Started OCR for file {}".format(pdf_blob.name))
-
-    # convert PDF to PNG files for annotation
-    if ANNOTATION_MODE:
-        convert_pdf2png(bucket, pdf_blob)
-
+    print("done with OCR response {}".format(async_response))
 
 def p2a_predict(bucket, json_blob):
 
+    print("starting with prediction for file {}".format(json_blob.name))
     # get pdf id and first page number
     m = re.match("(.*).output-([0-9]+)-.*", json_blob.name)
     pdf_id = m.group(1)
     first_page = int(m.group(2))
 
     # read the json file
-    csv = FEATURE_CSV_HEADER + "\n"
-    csv += build_feature_csv(json_blob, pdf_id, first_page)
+    csv = build_feature_csv(json_blob, pdf_id, first_page)
 
     # save the feature CSV file for prediction
     feature_file_name = "{}-{:03}-features.csv".format(pdf_id, first_page)
     feature_blob = bucket.blob(feature_file_name)
     feature_blob.upload_from_string(csv)
-    print("Feature CSV file saved: {}".format(feature_file_name))
+    # print("Feature CSV file saved: {}".format(feature_file_name))
     json_blob.delete()
-
-    # AutoML configs
-    gcs_input_uris = ["gs://{}/{}".format(bucket.name, feature_file_name)]
-    gcs_output_uri = "gs://{}".format(bucket.name)
-
-    # Query model
-    print("Started AutoML batch prediction for {}".format(feature_file_name))
-    response = automl_client.batch_predict(
-        gcs_input_uris=gcs_input_uris,
-        gcs_output_uri_prefix=gcs_output_uri,
-        model_display_name=model_display_name,
-    )
-    response.result()
-    print("Ended AutoML batch prediction for {}".format(feature_file_name))
-    if not ANNOTATION_MODE:
-        feature_blob.delete()
 
 
 def build_feature_csv(json_blob, pdf_id, first_page):
@@ -167,8 +138,8 @@ def build_feature_csv(json_blob, pdf_id, first_page):
     json_string = json_blob.download_as_string()
     json_response = json_format.Parse(json_string, vision.types.AnnotateFileResponse())
 
-    # covert the json file to a bag of CSV lines
-    csv = ""
+    # covert the json file to a bag of CSV lines.
+    csv = FEATURE_CSV_HEADER + "\n"
     page_count = first_page
     for resp in json_response.responses:
         para_count = 0
@@ -187,7 +158,7 @@ def build_feature_csv(json_blob, pdf_id, first_page):
 
             # output to csv
             for f in page_features:
-                csv += '{},"{}",{},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{}\n'.format(
+                csv += '{},"{}",{},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{:.6f},{}\n'.format(
                     f["para_id"],
                     f["text"],
                     f["chars"],
@@ -198,17 +169,54 @@ def build_feature_csv(json_blob, pdf_id, first_page):
                     f["pos_x"],
                     f["pos_y"],
                     f["aspect"],
+                    f["word_count"],
+                    f["average_word_height"],
                     f["layout"],
                 )
 
         page_count += 1
-    return csv
+
+    print("csv {}".format(csv))
+    df = pd.read_csv(io.StringIO(csv))
+    breaks = jenkspy.jenks_breaks(df["average_word_height"], n_classes=6)
+    print("breaks {}".format(breaks))
+
+    df["labels"] = df.apply(
+        lambda x: get_label(breaks, x["average_word_height"], x["layout"]), axis=1
+    )
+    df["classification_index"] = df.apply(
+        lambda x: get_classification_index(breaks, x["average_word_height"]), axis=1
+    )
+    return df.to_csv()
+
+
+def get_label(breaks, size, orientation):
+    label = LABEL_OTHER
+    if orientation == "v":
+        label = LABEL_OTHER
+    else:
+        if size < breaks[2]:
+            label = LABEL_OTHER
+        elif size >= breaks[2] and size < breaks[3]:
+            label = LABEL_CAPTION
+        elif size >= breaks[3] and size < breaks[4]:
+            label = LABEL_BODY
+        elif size >= breaks[4]:
+            label = LABEL_HEADER
+    return label
+
+
+def get_classification_index(breaks, size):
+    for i in range(len(breaks)):
+        if size < breaks[i]:
+            return i
 
 
 def extract_paragraph_feature(para_id, para):
 
     # collect text
     text = ""
+    w_height_list = []
     for word in para.words:
         for symbol in word.symbols:
             text += symbol.text
@@ -216,6 +224,12 @@ def extract_paragraph_feature(para_id, para):
                 break_type = symbol.property.detected_break.type
                 if str(break_type) == "1":
                     text += " "  # if the break is SPACE
+        w_y_list = []
+        for vertices in word.bounding_box.normalized_vertices:
+            w_y_list.append(vertices.y)
+            word_height = max(w_y_list) - min(w_y_list)
+            w_height_list.append(word_height)
+
 
     # remove double quotes
     text = text.replace('"', "")
@@ -241,6 +255,8 @@ def extract_paragraph_feature(para_id, para):
     f["pos_y"] = (f["height"] / 2.0) + min(y_list)
     f["aspect"] = f["width"] / f["height"] if f["height"] > 0 else 0
     f["layout"] = "h" if f["aspect"] > 1 else "v"
+    f["word_count"] = len(w_height_list)
+    f["average_word_height"] = sum(w_height_list) / len(w_height_list)
 
     return f
 
@@ -279,21 +295,8 @@ def parse_prediction_results(bucket, csv_blob):
         text = row["text"]
         text = text.replace("<", "")  # remove all '<'s for escaping in SSML
         text_dict[id] = text
+        label_dict[id] = row["labels"]
 
-        # build label_dict
-        sc_other = float(row["label_other_score"])
-        sc_body = float(row["label_body_score"])
-        sc_caption = float(row["label_caption_score"])
-        sc_header = float(row["label_header_score"])
-        #        if sc_other > 0.7:
-        if sc_other > max(sc_header, sc_body, sc_caption):
-            label_dict[id] = LABEL_OTHER
-        elif sc_header > max(sc_body, sc_caption):
-            label_dict[id] = LABEL_HEADER
-        elif sc_caption > sc_body:
-            label_dict[id] = LABEL_CAPTION
-        else:
-            label_dict[id] = LABEL_BODY
     sorted_ids = sorted(text_dict.keys())
     first_id = sorted_ids[0]
 
@@ -366,10 +369,10 @@ def generate_mp3_for_ssml(bucket, id, ssml):
     ssml = "<speak>\n" + ssml + "</speak>\n"
     synthesis_input = texttospeech.types.SynthesisInput(ssml=ssml)
     voice = texttospeech.types.VoiceSelectionParams(
-        language_code="ja-JP", ssml_gender=texttospeech.enums.SsmlVoiceGender.FEMALE
+        language_code="en-US", ssml_gender=texttospeech.enums.SsmlVoiceGender.MALE
     )
     audio_config = texttospeech.types.AudioConfig(
-        audio_encoding=texttospeech.enums.AudioEncoding.MP3, speaking_rate=1.5
+        audio_encoding=texttospeech.enums.AudioEncoding.MP3, speaking_rate=0.85
     )
 
     # generate speech
@@ -414,78 +417,3 @@ def merge_mp3_files(bucket, batch_id, mp3_blob_list):
     # delete mp3 files
     bucket.delete_blobs(mp3_blob_list)
     print("Ended merging mp3 files: {}".format(merged_mp3_file_name))
-
-
-#
-# Annotation tool functions
-#
-
-
-def p2a_generate_labels(bucket, automl_csv_blob):
-
-    # parse prediction results from AutoML
-    batch_id, sorted_ids, text_dict, label_dict = parse_prediction_results(
-        bucket, automl_csv_blob
-    )
-
-    # open features CSV
-    features_blob = bucket.get_blob(batch_id + "-features.csv")
-    features_string = features_blob.download_as_string().decode("utf-8")
-    csv = ""
-    if batch_id.endswith("001"):  # add csv header only for the first csv file
-        csv += FEATURE_CSV_HEADER + ",label\n"
-    for l in features_string.split("\n"):
-        m = re.match("^([^,]*-[0-9]+-[0-9]+),.*$", l)
-        if m:
-            id = m.group(1)
-            label = label_dict[id]
-            csv += l + "," + label + "\n"
-
-    # save the labels CSV file
-    labels_file_name = batch_id + "-labels.csv"
-    labels_blob = bucket.blob(labels_file_name)
-    labels_blob.upload_from_string(csv)
-    labels_blob.make_public()
-    print("Predicted results saved: {}".format(labels_file_name))
-    features_blob.delete()
-
-    # delete prediction result (tables_1.csv) files
-    folder_name = re.sub("/.*.csv", "", automl_csv_blob.name)
-    folder_blobs = storage_client.list_blobs(bucket, prefix=folder_name)
-    for b in folder_blobs:
-        b.delete()
-
-
-def convert_pdf2png(bucket, pdf_blob):
-
-    # download the PDF file to a temp file
-    print("Downloading PDF: {}".format(pdf_blob.name))
-    _, pdf_file_name = tempfile.mkstemp()
-    with open(pdf_file_name, "w+b") as pdf_file:
-        pdf_blob.download_to_file(pdf_file)
-
-    # convert the PDF to PNGs
-    print("Converting PDF to PNGs for {}".format(pdf_blob.name))
-    pdf_prefix = pdf_blob.name.replace(".pdf", "")[:4]
-    png_tempdir = tempfile.mkdtemp()
-    args = [
-        "pdf2png",
-        "-dSAFER",
-        "-sDEVICE=pngalpha",
-        "-r100",
-        "-sOutputFile={}/%03d.png".format(png_tempdir),
-        pdf_file_name,
-    ]
-    encoding = locale.getpreferredencoding()
-    args = [a.encode(encoding) for a in args]
-    ghostscript.Ghostscript(*args)
-
-    # save the PNGs on GCS
-    print("Saving PNGs for {}".format(pdf_blob.name))
-    for f in glob.glob(png_tempdir + "/*"):
-        png_blob = bucket.blob(pdf_prefix + "-images/" + os.path.split(f)[1])
-        png_blob.upload_from_filename(f, content_type="image/png")
-        png_blob.make_public()
-        os.remove(f)
-    print("Ended converting PDF to PNGs for {}".format(pdf_blob.name))
-    os.remove(pdf_file_name)
